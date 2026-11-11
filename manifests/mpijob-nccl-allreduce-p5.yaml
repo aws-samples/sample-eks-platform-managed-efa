@@ -1,0 +1,200 @@
+# NCCL all_reduce_perf across two p5.48xlarge nodes with the EFA stack
+# provided at pod start by the Platform-Managed EFA Runtime (init container).
+#
+# This is a proof of concept for the Platform-Managed EFA Runtime, not a performance-tuned job.
+#
+# Requirements: see README.md (EKS + EFA-capable AMI, NVIDIA and EFA device
+# plugins, Kubeflow MPI Operator v2beta1, hugepages on the GPU nodes).
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: distributed-training-job
+  namespace: default
+spec:
+  runPolicy:
+    cleanPodPolicy: None
+    backoffLimit: 20
+  slotsPerWorker: 8
+
+  mpiReplicaSpecs:
+    Launcher:
+      replicas: 1
+      template:
+        spec:
+          restartPolicy: OnFailure
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+          containers:
+            - name: launcher
+              image: public.ecr.aws/hpc-cloud/nccl-tests:latest
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: PATH
+                  value: /opt/amazon/openmpi/bin:/opt/amazon/efa/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                - name: LD_LIBRARY_PATH
+                  value: /opt/amazon/openmpi/lib64:/opt/amazon/efa/lib64:/opt/amazon/efa/lib:/opt/amazon/ofi-nccl/lib64:/opt/amazon/ofi-nccl/lib/x86_64-linux-gnu:/opt/nccl/build/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
+              command:
+                - /opt/amazon/openmpi/bin/mpirun
+                - --allow-run-as-root
+                - --tag-output
+                - -np
+                - "16"
+                - -N
+                - "8"
+                - --bind-to
+                - none
+                - -x
+                - PATH
+                - -x
+                - LD_LIBRARY_PATH
+                - -x
+                - FI_PROVIDER=efa
+                - -x
+                - FI_EFA_FORK_SAFE=1
+                - -x
+                - FI_PROVIDER_PATH=/opt/amazon/efa/lib64/libfabric
+                - -x
+                - FI_EFA_USE_DEVICE_RDMA=1
+                - -x
+                - NCCL_DEBUG=INFO
+                - -x
+                - NCCL_BUFFSIZE=8388608
+                - -x
+                - NCCL_P2P_NET_CHUNKSIZE=524288
+                - -x
+                - NCCL_NET_GDR_LEVEL=5
+                - --mca
+                - pml
+                - ^ucx
+                - --mca
+                - mtl
+                - ^ofi
+                - --mca
+                - btl
+                - tcp,self
+                - --mca
+                - btl_tcp_if_exclude
+                - lo,docker0,veth_def_agent
+                - /opt/nccl-tests/build/all_reduce_perf
+                - -b
+                - "8"
+                - -e
+                - "1G"
+                - -f
+                - "2"
+                - -g
+                - "1"
+                - -c
+                - "1"
+                - -n
+                - "50"
+
+    Worker:
+      replicas: 2
+      template:
+        spec:
+          nodeSelector:
+            nvidia-gpu: "enabled"
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+
+          # PLATFORM INIT CONTAINER: installs the EFA user-space stack into the
+          # shared efa-libs volume before the worker starts.
+          # Logic is identical to scripts/provision-efa-runtime.sh.
+          initContainers:
+            - name: efa-installer
+              image: public.ecr.aws/amazonlinux/amazonlinux:2023
+              env:
+                - name: EFA_INSTALLER_VERSION
+                  value: "latest"
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  echo "[Platform] Installing EFA userspace libraries (installer: ${EFA_INSTALLER_VERSION})..."
+                  yum install -y tar gzip libatomic util-linux findutils which --allowerasing
+                  cd /tmp
+                  curl -fsSL "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" -o efa-installer.tar.gz
+                  tar -xzf efa-installer.tar.gz
+                  cd aws-efa-installer
+                  ./efa_installer.sh -y -k
+                  echo "[Platform] Copying rdma-core + EFA provider libs into /opt/amazon/efa/lib64/..."
+                  cp -a /usr/lib64/libefa* /opt/amazon/efa/lib64/ 2>/dev/null || true
+                  cp -a /usr/lib64/libibverbs* /opt/amazon/efa/lib64/ 2>/dev/null || true
+                  cp -a /usr/lib64/librdmacm* /opt/amazon/efa/lib64/ 2>/dev/null || true
+                  cp -a /usr/lib64/libnl-3* /opt/amazon/efa/lib64/ 2>/dev/null || true
+                  cp -a /usr/lib64/libnl-route* /opt/amazon/efa/lib64/ 2>/dev/null || true
+                  ls -la /opt/amazon/efa/lib64/libefa* /opt/amazon/efa/lib64/libibverbs*
+                  echo "[Platform] Installed components:"
+                  ls /opt/amazon/
+                  echo "[Platform] EFA Version Manifest:"
+                  grep "Version" /opt/amazon/efa/lib64/pkgconfig/libfabric.pc 2>/dev/null || true
+                  find /opt/amazon/ofi-nccl -name "libnccl-net*" -exec ls -la {} \; 2>/dev/null || true
+              volumeMounts:
+                - name: efa-libs
+                  mountPath: /opt/amazon
+              resources:
+                requests:
+                  cpu: 2000m
+                  memory: 4096Mi
+                limits:
+                  cpu: 4000m
+                  memory: 8192Mi
+
+          # USER CONTAINER: consumes the platform-provided stack via read-only subPath
+          # mounts. No EFA-specific build steps are needed in this image.
+          containers:
+            - name: worker
+              image: public.ecr.aws/hpc-cloud/nccl-tests:latest
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: LD_LIBRARY_PATH
+                  value: "/opt/amazon/openmpi/lib64:/opt/amazon/efa/lib64:/opt/amazon/efa/lib:/opt/amazon/ofi-nccl/lib64:/opt/amazon/ofi-nccl/lib/x86_64-linux-gnu:/opt/nccl/build/lib:/usr/local/lib/python3.10/dist-packages/torch/lib:/usr/local/lib/python3.10/dist-packages/torch_tensorrt/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+                - name: PATH
+                  value: "/opt/amazon/openmpi/bin:/opt/amazon/efa/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                - name: FI_PROVIDER
+                  value: "efa"
+                - name: FI_EFA_FORK_SAFE
+                  value: "1"
+                - name: FI_PROVIDER_PATH
+                  value: "/opt/amazon/efa/lib64/libfabric"
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+              volumeMounts:
+                - name: efa-libs
+                  mountPath: /opt/amazon/efa
+                  subPath: efa
+                  readOnly: true
+                - name: efa-libs
+                  mountPath: /opt/amazon/ofi-nccl
+                  subPath: ofi-nccl
+                  readOnly: true
+                - name: efa-libs
+                  mountPath: /opt/amazon/openmpi
+                  subPath: openmpi
+                  readOnly: true
+                - name: shmem
+                  mountPath: /dev/shm
+              resources:
+                requests:
+                  nvidia.com/gpu: 8
+                  hugepages-2Mi: 5120Mi
+                  vpc.amazonaws.com/efa: 32
+                  memory: 64000Mi
+                limits:
+                  nvidia.com/gpu: 8
+                  hugepages-2Mi: 5120Mi
+                  vpc.amazonaws.com/efa: 32
+                  memory: 64000Mi
+
+          volumes:
+            - name: efa-libs
+              emptyDir: {}
+            - name: shmem
+              hostPath:
+                path: /dev/shm
