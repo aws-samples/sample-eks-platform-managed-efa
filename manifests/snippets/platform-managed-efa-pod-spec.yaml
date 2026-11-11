@@ -1,0 +1,85 @@
+# Minimal, reusable Platform-Managed EFA Runtime fragment for any Pod template.
+#
+# Merge these fields into your own pod spec (Deployment, Job, PyTorchJob,
+# MPIJob worker, etc.). Replace <your-training-image> and adjust the
+# resource requests for your instance type.
+#
+# Number of EFA interfaces per instance (vpc.amazonaws.com/efa):
+#   p5.48xlarge = 32, p4d.24xlarge = 4. Check your instance type's documentation.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: platform-managed-efa-example
+spec:
+  initContainers:
+    - name: efa-installer
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      env:
+        - name: EFA_INSTALLER_VERSION
+          value: "latest"   # pin for reproducibility, e.g. "1.38.0"
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -e
+          yum install -y tar gzip libatomic util-linux findutils which --allowerasing
+          cd /tmp
+          curl -fsSL "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" -o efa-installer.tar.gz
+          tar -xzf efa-installer.tar.gz
+          cd aws-efa-installer
+          ./efa_installer.sh -y -k
+          for lib in libefa libibverbs librdmacm libnl-3 libnl-route; do
+            cp -a /usr/lib64/${lib}* /opt/amazon/efa/lib64/ 2>/dev/null || true
+          done
+      volumeMounts:
+        - name: efa-libs
+          mountPath: /opt/amazon        # init container sees the whole volume
+      resources:
+        requests: { cpu: 2000m, memory: 4096Mi }
+        limits:   { cpu: 4000m, memory: 8192Mi }
+
+  containers:
+    - name: app
+      image: <your-training-image>
+      env:
+        - name: FI_PROVIDER
+          value: "efa"
+        - name: FI_PROVIDER_PATH
+          value: "/opt/amazon/efa/lib64/libfabric"
+        - name: FI_EFA_FORK_SAFE
+          value: "1"
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: "1"
+        # Prepend the platform paths; keep whatever your image already needs after them.
+        - name: LD_LIBRARY_PATH
+          value: "/opt/amazon/openmpi/lib64:/opt/amazon/efa/lib64:/opt/amazon/efa/lib:/opt/amazon/ofi-nccl/lib64:/opt/amazon/ofi-nccl/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+        - name: PATH
+          value: "/opt/amazon/openmpi/bin:/opt/amazon/efa/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      # Mount only the platform-provided sub-directories so nothing else the image keeps
+      # under /opt/amazon is hidden.
+      volumeMounts:
+        - name: efa-libs
+          mountPath: /opt/amazon/efa
+          subPath: efa
+          readOnly: true
+        - name: efa-libs
+          mountPath: /opt/amazon/ofi-nccl
+          subPath: ofi-nccl
+          readOnly: true
+        - name: efa-libs
+          mountPath: /opt/amazon/openmpi
+          subPath: openmpi
+          readOnly: true
+        - name: shmem
+          mountPath: /dev/shm
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 32
+          hugepages-2Mi: 5120Mi
+
+  volumes:
+    - name: efa-libs
+      emptyDir: {}
+    - name: shmem
+      hostPath:
+        path: /dev/shm
